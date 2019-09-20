@@ -1,18 +1,13 @@
 import { Injectable } from '@angular/core';
-import { Observable, fromEvent, EMPTY, Subject } from 'rxjs';
+import { Observable, fromEvent, Subject, merge } from 'rxjs';
 import { filter, tap, share } from 'rxjs/operators';
 import { BaseService } from '../main/base-service';
 import { Main } from '../main/main';
 
 /**
- * Массив клавиш
+ * Типы событий для нажатия клавишь
  */
-export const KeysArray = ['w', 'a', 's', 'd'];
-
-/**
- * Клавиши
- */
-export type Keys = typeof KeysArray[number];
+export type KeyEventType = 'down' |'up' | 'pressed';
 
 /**
  * Объект события клавиши
@@ -23,96 +18,117 @@ export interface KeyEventsObservable {
     pressed: Observable<KeyboardEvent>;
 }
 
+/**
+ * Сервис организации управления путем подписок на нажатие клавишь клавиатуры
+ */
 @Injectable()
 export class KeyboardController extends BaseService {
-    /** Observable на up KeyboardEvent нажатие клавишь в приложении */
-    private _$up: Observable<KeyboardEvent>;
-    
-    /** Observable на down KeyboardEvent нажатие клавишь в приложении */
-    private _$down: Observable<KeyboardEvent>;
+    /** Subject для рассылки уведомления о зажатых клавишах */
+    private _pressedSubject: Subject<KeyboardEvent> = new Subject();
 
-    /** Observable на press KeyboardEvent нажатие клавишь в приложении */
-    private _$pressed: Subject<KeyboardEvent>;
-
-    /** Массив уже нажатых клавишь */
+    /** Массив зажатых клавишь */
     private _pressedKeyEvents: Map<KeyboardEvent['key'], KeyboardEvent> = new Map();
+
+    /** Observable на события нажатий клавиш */
+    private _keyObservables: {
+        [type in KeyEventType]: Observable<KeyboardEvent>
+    };
+
+    /** Объект соответствий клавиши и типа события нажатия клавиши с _keyObservables */
+    private _keyEvents: {
+        [type in KeyEventType]: {
+            [key: string]: Observable<KeyboardEvent>
+        }
+    } = {
+        up: {},
+        down: {},
+        pressed: {},
+    };
 
     /**
      * Комбинация зажатых клавишь проверяется для каждой клавиши в одну итерацию. Таким образом за одну итерацию
      * обработка срабатывает столько раз, сколько клавишь в комбинации. Чтобы предотвратить это использую lock объект,
      * который обновляется в начале каждой итерации
      */
-    private _combinationLock: { [key in symbol]: true };
+    private _iterationSign: boolean = false;
 
-    /** Объект observable на нажатие клавиш в приложении */
-    public keys: {
-        [key in Keys]: KeyEventsObservable;
-    } & {
-        all: KeyEventsObservable;
-        combination(...keys: Keys[]): KeyEventsObservable;
-    };
-
-    public onInit(instance: Main): void {
+    protected onInit(instance: Main): void {
         // создание слушателей событий нажатий на клавиши
-        this._$down = (fromEvent(window, 'keydown') as Observable<KeyboardEvent>).pipe(
-            filter(event => !this._pressedKeyEvents.has(event.key)),
-            tap(event => this._pressedKeyEvents.set(event.key, event)),
-            share()
-        );
-        this._$up = (fromEvent(window, 'keyup') as Observable<KeyboardEvent>).pipe(
-            tap(event => this._pressedKeyEvents.delete(event.key)),
-            share()
-        );
-        this._$pressed = new Subject();
-
-        // создается заготовка под будущий обьект
-        this.keys = {} as any;
-
-        // создание observable-ов для каждой клавиши
-        KeysArray.forEach(key => {
-            this.keys[key] = {
-                up: this._$up.pipe(filter((event: KeyboardEvent) => event.key === key)),
-                down: this._$down.pipe(filter((event: KeyboardEvent) => event.key === key)),
-                pressed: this._$pressed.pipe(filter((event: KeyboardEvent) => event.key === key)),
-            };
-        });
-
-        // создание observable-ов на все клавиши
-        this.keys.all = {
-            up: this._$up,
-            down: this._$down,
-            pressed: this._$pressed,
-        };
-
-        // создание функции комбинации клавиш
-        this.keys.combination = (...combination) => {
-            const combinationId = Symbol();
-            return {
-                up: this._$up.pipe(filter(event => {
-                    return combination.every(key => this._pressedKeyEvents.has(key) || event.key === key);
-                })),
-                down: this._$down.pipe(filter(_ => {
-                    return combination.every(key => this._pressedKeyEvents.has(key));
-                })),
-                pressed: this._$pressed.pipe(filter(_ => {
-                    if (!this._combinationLock[combinationId] && combination.every(key => this._pressedKeyEvents.has(key))) {
-                        return this._combinationLock[combinationId] = true;
-                    }
-                })),
-            } as KeyEventsObservable;
+        this._keyObservables = {
+            up: (fromEvent(window, 'keyup') as Observable<KeyboardEvent>).pipe(
+                tap(event => this._pressedKeyEvents.delete(event.key)),
+                share()
+            ),
+            down: (fromEvent(window, 'keydown') as Observable<KeyboardEvent>).pipe(
+                // этот фильтр нужен, чтобы keydown не срабатывал несколько раз при зажатии клавиши
+                filter(event => !this._pressedKeyEvents.has(event.key)),
+                tap(event => this._pressedKeyEvents.set(event.key, event)),
+                share()
+            ),
+            pressed: this._pressedSubject.asObservable(),
         };
 
         // подписываемся на up и down, чтобы приложение сразу стало записывать клавиши в _pressedKeys
-        this._$up.subscribe();
-        this._$down.subscribe();
+        this._keyObservables.up.subscribe();
+        this._keyObservables.down.subscribe();
+
+        // подключение обработки зажатых клавиш
+        instance.beforeCalculate.push(() => this._emmitPressed());
+    }
+
+    /**
+     * Метод подписки на событие нажатия клавиши
+     * @param keys - клавиша, событее которой отслеживается. Если отправить массив будет отслеживаться комбинация клавишь
+     * @param type - тип события нажатия клавиши. По умолчанию зажатые клавиши
+     * @TODO доработать метод так, чтобы принимались русские клавиши и такие клавиши как Alt, Ctrl, Shift, Esc, Enter, Tab и т.п.
+     */
+    public key(keys: 'any' | string | string[], type: KeyEventType = 'pressed'): Observable<KeyboardEvent> {
+        // преобразование входных аргументов в массив
+        const keysArray = Array.isArray(keys) ? keys : [keys];
+
+        // получение массива observable событий типа type на каждую клавишу из keys
+        const keysObservers = keysArray.map(key => {
+            if (!this._keyEvents[type][key]) {
+                // @TODO удалять этот объект, когда нет подписчиков
+                this._keyEvents[type][key] = keys === 'any'
+                    ? this._keyObservables[type]
+                    : this._keyObservables[type].pipe(filter((event: KeyboardEvent) => event.key === key));
+            }
+            return this._keyEvents[type][key];
+        });
+
+        if (keysObservers.length > 1) {
+            const mergedObservers = merge(...keysObservers);
+            switch(type) {
+                case 'up':
+                    return mergedObservers.pipe(filter(event => {
+                        return keysArray.every(key => this._pressedKeyEvents.has(key) || event.key === key);
+                    }));
+                case 'down':
+                    return mergedObservers.pipe(filter(_ => {
+                        return keysArray.every(key => this._pressedKeyEvents.has(key));
+                    }));
+                case 'pressed':
+                    let lock = null;
+                    return mergedObservers.pipe(filter(_ => {
+                        // lock не позволяет одной и той же комбинации сработать несколько раз за итерацию
+                        if (lock !== this._iterationSign && keysArray.every(key => this._pressedKeyEvents.has(key))) {
+                            lock = this._iterationSign;
+                            return true;
+                        }
+                    }));
+            }
+        } else {
+            return keysObservers[0];
+        }
     }
 
     /**
      * Метод рассылки событий уже нажатых клавиш подписчикам на pressed клавиши
      */
-    public emmitPressed() {
-        // очищаем lock объект для комбинаций
-        this._combinationLock = {};
-        this._pressedKeyEvents.forEach(event => this._$pressed.next(event));
+    private _emmitPressed() {
+        // переключаем _iterationSign для сбрасывания lock в комбинациях
+        this._iterationSign = !this._iterationSign;
+        this._pressedKeyEvents.forEach(event => this._pressedSubject.next(event));
     }
 }

@@ -16,5 +16,5 @@ export abstract class BaseService extends Collector {
     }
 
     /** Событие, которое вызывается при инициализации приложения */
-    public abstract onInit(instance: Main): void;
+    protected abstract onInit(instance: Main): void;
 }
